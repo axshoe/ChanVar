@@ -1,0 +1,67 @@
+[build-system]
+requires = ["setuptools>=65", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "chanvar"
+version = "1.0.0"
+description = "In silico functional annotation of rare CACNA1A variants in Familial Hemiplegic Migraine"
+readme = "README.md"
+license = {text = "MIT"}
+authors = [
+    {name = "Angie Xiu", email = "angie.xiu27@gmail.com"}
+]
+keywords = ["CACNA1A", "FHM1", "channelopathy", "migraine", "variant-annotation"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Bio-Informatics",
+]
+requires-python = ">=3.9"
+dependencies = [
+    "numpy>=1.24",
+    "scipy>=1.10",
+    "pandas>=2.0",
+    "biopython>=1.81",
+    "requests>=2.28",
+    "scikit-learn>=1.3",
+    "matplotlib>=3.7",
+    "xgboost>=1.7",
+    "shap>=0.42",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov>=4.0",
+]
+
+[project.scripts]
+chanvar = "chanvar.cli:main"
+
+[project.urls]
+Homepage = "https://thexiulab.org"
+Repository = "https://github.com/axshoe/ChanVar"
+
+[tool.setuptools]
+packages = [
+    "chanvar",
+    "chanvar.data",
+    "chanvar.structure",
+    "chanvar.evolution",
+    "chanvar.scoring",
+    "chanvar.report",
+    "chanvar.viz",
+]
+
+[tool.setuptools.package-data]
+"chanvar.data" = ["*.json", "*.tsv"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-v --tb=short"
