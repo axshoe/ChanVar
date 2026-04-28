@@ -316,11 +316,11 @@ def get_domain_for_residue(residue_number: int) -> str:
 
 # Domain-specific weight for pathogenicity scoring (f5 in CPS)
 DOMAIN_PATHOGENICITY_WEIGHTS = {
-    "voltage_sensor": 1.0,       # Arginine mutations: highest impact
-    "selectivity_filter": 1.0,   # EEEE locus: critical for Ca2+ selectivity
-    "pore_lining": 0.8,          # S5-S6: important for gating and pore geometry
-    "IIIIV_linker": 0.6,         # Inactivation gate: affects kinetics
-    "interdomain_linker": 0.5,   # S1-S3, inter-domain linkers
-    "C_terminal": 0.4,           # SNARE interaction: affects coupling
-    "N_terminal": 0.3,           # N-terminal: less characterized
+    "voltage_sensor": 0.92,
+    "selectivity_filter": 0.92,
+    "pore_lining": 1.00,
+    "interdomain_linker": 0.57,
+    "N_terminal": 0.73,
+    "C_terminal": 0.30,
+    "IIIIV_linker": 0.57,    # same as interdomain_linker
 }

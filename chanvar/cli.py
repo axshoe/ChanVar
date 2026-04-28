@@ -16,6 +16,7 @@ All commands produce JSON output by default; add --format markdown or --format h
 
 import argparse
 import json
+import os
 import logging
 import sys
 from pathlib import Path
@@ -89,7 +90,25 @@ def cmd_batch(args):
         from chanvar.evolution.conservation import load_conservation_scores
         conservation_scores = load_conservation_scores(args.conservation)
 
-    features_list = batch_build_features(variants, conservation_scores=conservation_scores)
+    # FoldX integration: use repaired PDB if FOLDX_PATH and PDB are available
+    pdb_path = args.pdb if hasattr(args, "pdb") and args.pdb else None
+    run_foldx = False
+    if pdb_path and os.environ.get("FOLDX_PATH"):
+        if Path(pdb_path).exists():
+            run_foldx = True
+            logger.info("FoldX enabled. Using PDB: %s", pdb_path)
+        else:
+            logger.warning("PDB file not found: %s. FoldX disabled.", pdb_path)
+    elif os.environ.get("FOLDX_PATH"):
+        logger.info("FOLDX_PATH set but no --pdb provided. FoldX disabled.")
+        logger.info("Re-run with: chanvar batch --input ... --pdb AF-O00555-F1-model_v4_Repair.pdb")
+
+    features_list = batch_build_features(
+        variants,
+        conservation_scores=conservation_scores,
+        pdb_path=pdb_path,
+        run_foldx=run_foldx,
+    )
     results = batch_score(features_list, bootstrap_n=500)
 
     # Output directory — strip trailing slash/backslash so Path works on Windows
@@ -213,8 +232,9 @@ Documentation: https://github.com/axshoe/chanvar
     # batch
     bat = subparsers.add_parser("batch", help="Score a CSV of variants")
     bat.add_argument("--input", required=True, help="Input CSV with aa_change column")
-    bat.add_argument("--output", help="Output CSV path")
+    bat.add_argument("--output", help="Output directory for per-variant reports")
     bat.add_argument("--conservation", help="Path to cacna1a_conservation.tsv")
+    bat.add_argument("--pdb", help="Path to repaired AlphaFold2 PDB for FoldX ddG (e.g. AF-O00555-F1-model_v4_Repair.pdb). Requires FOLDX_PATH env var.")
     bat.set_defaults(func=cmd_batch)
 
     # train

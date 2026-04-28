@@ -168,7 +168,7 @@ def run_foldx_ddg(
     residue_number: int,
     ref_aa: str,
     alt_aa: str,
-    foldx_executable: str = "foldx",
+    foldx_executable: Optional[str] = None,
     temp_dir: Optional[str] = None,
 ) -> Optional[float]:
     """
@@ -210,14 +210,32 @@ def run_foldx_ddg(
     The FoldX license restricts redistribution; do not bundle the binary in the repo.
     Expected runtime: 2-10 minutes per variant for RepairPDB + BuildModel.
     """
-    # Check if FoldX is available
-    if subprocess.run(["which", foldx_executable], capture_output=True).returncode != 0:
-        logger.warning(
-            "FoldX not found at '%s'. Install from foldxsuite.biocreatec.com. "
-            "Returning None for dDDG.",
-            foldx_executable,
-        )
-        return None
+    # Resolve FoldX executable path
+    # Priority: argument > FOLDX_PATH env var > "foldx" on PATH
+    import shutil as _shutil
+    import sys as _sys
+
+    if foldx_executable is None:
+        foldx_executable = os.environ.get("FOLDX_PATH", "foldx")
+
+    # Check if the executable exists and is runnable
+    # Use a cross-platform check (works on Windows and Linux)
+    fx_path = Path(foldx_executable)
+    if fx_path.exists():
+        foldx_executable = str(fx_path.resolve())
+    else:
+        # Try finding it on PATH
+        found = _shutil.which(foldx_executable)
+        if found is None:
+            logger.warning(
+                "FoldX not found at '%s'. Set FOLDX_PATH environment variable "
+                "or pass the full path. Returning None for dDDG.",
+                foldx_executable,
+            )
+            return None
+        foldx_executable = found
+
+    logger.info("Using FoldX at: %s", foldx_executable)
 
     with tempfile.TemporaryDirectory(dir=temp_dir) as workdir:
         pdb_name = Path(pdb_path).stem
@@ -271,22 +289,39 @@ def run_foldx_ddg(
 
 
 def _parse_foldx_output(workdir: str, pdb_name: str) -> Optional[float]:
-    """Parse dDDG from FoldX Average_BuildModel output file."""
-    output_file = Path(workdir) / f"Average_{pdb_name}_Repair.fxout"
-    if not output_file.exists():
-        # Try alternative output filename patterns
-        output_file = Path(workdir) / f"Average_{pdb_name}.fxout"
-    if not output_file.exists():
-        logger.warning("FoldX output file not found in %s", workdir)
-        return None
+    """Parse dDDG from FoldX Dif_BuildModel output file.
 
-    for line in output_file.read_text().splitlines():
-        parts = line.split("\t")
-        if len(parts) >= 2:
-            try:
-                return float(parts[1])  # dDDG is column 2 in Average output
-            except (ValueError, IndexError):
-                continue
+    FoldX 5.1 output files:
+      Dif_*.fxout  - columns: Pdb | total_energy(ddG) | Backbone_Hbond | ...
+      Average_*.fxout - columns: Pdb | SD | total_energy | ...  (SD in col 1)
+
+    The Dif_ file contains the energy DIFFERENCE (mutant - wildtype) = ddG.
+    Column index [1] in Dif_ is the ddG value we want.
+    """
+    # Try Dif_ file first (correct file for ddG)
+    candidates = [
+        Path(workdir) / f"Dif_{pdb_name}_Repair.fxout",
+        Path(workdir) / f"Dif_{pdb_name}.fxout",
+        # Fallback to Average_ with corrected column index [2]
+        Path(workdir) / f"Average_{pdb_name}_Repair.fxout",
+        Path(workdir) / f"Average_{pdb_name}.fxout",
+    ]
+
+    for output_file in candidates:
+        if not output_file.exists():
+            continue
+        use_col = 1 if "Dif_" in output_file.name else 2
+        for line in output_file.read_text().splitlines():
+            parts = line.split("\t")
+            if len(parts) > use_col and not line.startswith("Pdb") and not line.startswith("FoldX"):
+                try:
+                    val = float(parts[use_col])
+                    logger.debug("Parsed ddG=%.4f from %s col %d", val, output_file.name, use_col)
+                    return val
+                except (ValueError, IndexError):
+                    continue
+
+    logger.warning("FoldX output file not found or unparseable in %s", workdir)
     return None
 
 

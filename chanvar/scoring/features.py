@@ -374,6 +374,8 @@ def _parse_aa_change(aa_change: str) -> tuple[Optional[str], Optional[int], Opti
 def batch_build_features(
     variant_list: list[dict],
     conservation_scores: Optional[dict] = None,
+    pdb_path: Optional[str] = None,
+    run_foldx: bool = False,
 ) -> list[VariantFeatures]:
     """
     Build feature vectors for a list of variants.
@@ -385,6 +387,14 @@ def batch_build_features(
         Optional keys: all parameters accepted by build_feature_vector.
     conservation_scores : dict, optional
         Pre-loaded conservation data (avoids reloading for each variant).
+    pdb_path : str, optional
+        Path to the AlphaFold2 or repaired PDB structure. If provided and
+        run_foldx=True, FoldX will be called for each variant to compute ddG.
+        Use the pre-repaired PDB (e.g. AF-O00555-F1-model_v4_Repair.pdb) to
+        avoid re-running RepairPDB for every variant.
+    run_foldx : bool
+        If True and pdb_path is set, call FoldX for each variant. This adds
+        3-8 minutes per variant. Default False.
 
     Returns
     -------
@@ -393,6 +403,7 @@ def batch_build_features(
         are skipped with a warning.
     """
     results = []
+
     def _float(val):
         """Convert CSV string to float, return None if empty or unparseable."""
         if val is None or str(val).strip() == "":
@@ -402,13 +413,56 @@ def batch_build_features(
         except (ValueError, TypeError):
             return None
 
+    # Import FoldX runner only if needed
+    foldx_runner = None
+    if run_foldx and pdb_path:
+        try:
+            from chanvar.structure.stability import run_foldx_ddg
+            foldx_runner = run_foldx_ddg
+            logger.info("FoldX integration enabled. PDB: %s", pdb_path)
+            logger.info("Estimated time: %d--%d minutes for %d variants",
+                        len(variant_list) * 3, len(variant_list) * 8, len(variant_list))
+        except ImportError:
+            logger.warning("Could not import run_foldx_ddg. FoldX will not run.")
+
     for i, var in enumerate(variant_list):
         try:
+            aa_change = var["aa_change"]
+
+            # Parse amino acid change for FoldX call
+            ddg_foldx_val = _float(var.get("ddg_foldx") or var.get("ddg"))
+
+            # Run FoldX if enabled and ddG not already provided in CSV
+            if foldx_runner and pdb_path and ddg_foldx_val is None:
+                import re
+                m = re.match(r"([A-Z])(\d+)([A-Z])", aa_change)
+                if m:
+                    ref_aa, pos, alt_aa = m.group(1), int(m.group(2)), m.group(3)
+                    logger.info(
+                        "[%d/%d] Running FoldX for %s...",
+                        i + 1, len(variant_list), aa_change
+                    )
+                    try:
+                        ddg_foldx_val = foldx_runner(
+                            pdb_path=pdb_path,
+                            chain="A",
+                            residue_number=pos,
+                            ref_aa=ref_aa,
+                            alt_aa=alt_aa,
+                        )
+                        if ddg_foldx_val is not None:
+                            logger.info("  ddG(%s) = %.3f kcal/mol", aa_change, ddg_foldx_val)
+                        else:
+                            logger.warning("  FoldX returned None for %s", aa_change)
+                    except Exception as fx_exc:
+                        logger.warning("  FoldX failed for %s: %s", aa_change, fx_exc)
+                        ddg_foldx_val = None
+
             fv = build_feature_vector(
                 variant_id=var.get("variant_id", f"unknown_{i}"),
-                aa_change=var["aa_change"],
+                aa_change=aa_change,
                 gnomad_af=_float(var.get("af")),
-                ddg_foldx=_float(var.get("ddg_foldx") or var.get("ddg")),
+                ddg_foldx=ddg_foldx_val,
                 ddg_evoef2=_float(var.get("ddg_evoef2")),
                 rmsd=_float(var.get("rmsd")),
                 conservation_scores=conservation_scores,
