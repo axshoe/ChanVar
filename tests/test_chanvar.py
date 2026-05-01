@@ -333,7 +333,7 @@ class TestBuildFeatureVector:
     def test_feature_vector_length(self):
         """Feature vector always has 8 elements."""
         fv = build_feature_vector(variant_id="19-X", aa_change="R192Q")
-        assert len(fv.feature_vector) == 8
+        assert len(fv.feature_vector) == 9
 
 
 class TestWeightedMean:

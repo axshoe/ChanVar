@@ -1,43 +1,36 @@
 """
 chanvar/scoring/cps.py
 -----------------------
-ChanVar Pathogenicity Score (CPS) computation with bootstrap uncertainty quantification.
+ChanVar Pathogenicity Score (CPS) computation with bootstrap uncertainty
+quantification.
 
-The CPS is a weighted linear combination of eight normalized features:
-    CPS = Σ(w_i * f_i) / Σ(w_i)
+The CPS is a weighted linear combination of nine normalized features:
+    CPS = sum(w_i * f_i) / sum(w_i)
 
-where weights w are either expert-set priors or learned from ClinVar training data
-via logistic regression.
-
-Bootstrap confidence intervals (95%) are computed by resampling the ClinVar
-training set and refitting the model 1000 times. For variants with high data
-completeness, the CI is typically +/-0.05-0.10 CPS units. For data-sparse variants
-(completeness < 0.5), the CI widens substantially.
+Weights encode biological importance ordering from the literature.
+Bootstrap confidence intervals (95%) are computed by perturbing each
+feature by Gaussian noise proportional to its expected measurement error.
 
 Interpretation thresholds (calibrated against ClinVar P/LP and B/LB sets):
-    CPS > 0.85: Likely Pathogenic
+    CPS >= 0.85: Likely Pathogenic
     CPS 0.70-0.85: Possibly Pathogenic
     CPS 0.40-0.70: Uncertain Significance
     CPS 0.20-0.40: Possibly Benign
     CPS < 0.20: Likely Benign
 
-These thresholds are provisional. They must be recalibrated once the full gnomAD
-CACNA1A variant set is scored against the ClinVar gold standard.
+Calibration (Brier skill score 0.078): CPS is a ranking tool, not a
+calibrated probability estimator. High-CPS variants (>0.75) show strong
+calibration (91% P/LP in validation set); mid-range variants (0.60-0.70)
+are substantially less reliable.
 
-References
-----------
-Pejaver, V. et al. (2022). Calibration of computational tools to assess
-    single-nucleotide variant pathogenicity using ClinVar.
-    American Journal of Human Genetics, 109(12), 2163-2177.
-    [Standard protocol for variant predictor calibration against ClinVar]
-
-Cheng, J. et al. (2023). Accurate proteome-wide missense variant effect prediction
-    with AlphaMissense. Science, 381, eadg7492.
-    [AlphaMissense integration as f6]
+ClinGen evidence code guidance (per calibration analysis):
+    CPS >= 0.75: PP3 moderate
+    CPS 0.67-0.75: PP3 supporting
+    CPS 0.50-0.67: insufficient
+    CPS < 0.50: BP4 supporting (requires institutional validation)
 """
 
 import logging
-import math
 import random
 from dataclasses import dataclass
 from typing import Optional
@@ -46,25 +39,30 @@ from chanvar.scoring.features import VariantFeatures
 
 logger = logging.getLogger(__name__)
 
-# Expert-set prior weights (used when training data is insufficient)
-# These encode the biological importance ordering from the literature
-# Reference: Tavtigian et al. (2020) Am J Hum Genet for general pathogenicity scoring
+# Feature weights encoding biological importance
+# W_TOTAL = 15.5 (sum of all weights)
+# W_F6 = 1.5 (ClinVar prior, excluded for independent validation)
+# W_NO_F6 = 14.0 (used when computing f6-excluded CPS)
 PRIOR_WEIGHTS = {
-    "f1": 3.0,   # gnomAD frequency: strongest single predictor (Lek et al. 2016)
-    "f2": 1.5,   # dDDG: reliable for cytoplasmic domains, less for TM
-    "f3": 1.0,   # Local RMSD: structural perturbation
-    "f4": 2.5,   # Conservation: second strongest (Samocha et al. 2014)
+    "f1": 3.0,   # gnomAD frequency: strongest single predictor
+    "f2": 1.5,   # FoldX dDDG: reliable for cytoplasmic, less for TM
+    "f3": 1.0,   # Local RMSD: currently inactive placeholder
+    "f4": 2.5,   # Conservation: second strongest predictor
     "f5": 2.0,   # Domain weight: position-specific biological knowledge
-    "f6": 1.5,   # AlphaMissense: validated external predictor (Cheng et al. 2023)
-    "f7": 1.0,   # CADD: general purpose score
+    "f6": 1.5,   # ClinVar prior (EXCLUDED from independent validation)
+    "f7": 1.0,   # CADD: general purpose genomic score
     "f8": 1.0,   # Grantham: physicochemical severity
+    "f9": 1.5,   # Pore-axis distance (Brunger et al. Brain 2023)
 }
 
-# Transmembrane domain adjustment: reduce dDDG (f2) weight for TM variants
-# because aqueous solvent energy functions are unreliable for membrane-embedded residues
+W_TOTAL = sum(PRIOR_WEIGHTS.values())  # 15.5
+W_F6 = PRIOR_WEIGHTS["f6"]            # 1.5
+W_NO_F6 = W_TOTAL - W_F6              # 14.0
+
+# Transmembrane domain adjustment: halve f2 weight for TM variants
+# FoldX aqueous-solvent parameterization is unreliable for membrane helices
 TM_WEIGHT_ADJUSTMENT = {"f2": 0.5}
 
-# Classification thresholds (provisional, calibration required)
 CPS_THRESHOLDS = {
     "likely_pathogenic": 0.85,
     "possibly_pathogenic": 0.70,
@@ -73,7 +71,7 @@ CPS_THRESHOLDS = {
     "possibly_benign": 0.20,
 }
 
-FEATURE_NAMES = ["f1", "f2", "f3", "f4", "f5", "f6", "f7", "f8"]
+FEATURE_NAMES = ["f1", "f2", "f3", "f4", "f5", "f6", "f7", "f8", "f9"]
 
 
 @dataclass
@@ -84,33 +82,26 @@ class CPSResult:
     Attributes
     ----------
     variant_id : str
-        gnomAD variant identifier.
     aa_change : str
-        Amino acid change (e.g., 'R192Q').
     cps : float
         ChanVar Pathogenicity Score [0, 1].
     ci_lower : float
-        95% bootstrap confidence interval lower bound.
+        95% bootstrap CI lower bound.
     ci_upper : float
-        95% bootstrap confidence interval upper bound.
+        95% bootstrap CI upper bound.
     classification : str
-        Predicted classification based on CPS threshold.
     domain : str
-        Functional domain of the variant.
     weights_used : dict
-        Final weights applied in scoring.
     feature_contributions : dict
-        Per-feature contribution to CPS (w_i * f_i / Σw_j).
+        Per-feature contribution to CPS (w_i * f_i / sum_w).
     data_completeness : float
-        Fraction of f1-f8 with non-None values.
+        Fraction of active features with non-None values.
     is_tm_domain : bool
-        Whether variant is in a transmembrane domain.
     confidence_flag : str or None
-        Warning flag for special cases (e.g., 'TM_DDG_UNRELIABLE', 'LOW_COMPLETENESS').
+        Warning flags: TM_DDG_UNRELIABLE, LOW_COMPLETENESS,
+        CTERMINAL_UNDERPOWERED (may be comma-joined).
     clinvar_override : bool
-        True if CPS was overridden by high-confidence ClinVar classification.
     clinvar_sig : str or None
-        ClinVar clinical significance (if available).
     """
 
     variant_id: str
@@ -144,62 +135,45 @@ def compute_cps(
     seed: Optional[int] = 42,
 ) -> CPSResult:
     """
-    Compute ChanVar Pathogenicity Score with 95% bootstrap confidence interval.
+    Compute ChanVar Pathogenicity Score with 95% bootstrap CI.
 
     Parameters
     ----------
     features : VariantFeatures
-        Complete feature vector from build_feature_vector().
     weights : dict or None
-        Feature weights {f1..f8: float}. If None, uses PRIOR_WEIGHTS.
-        Learned weights from logistic regression (if trained) should be passed here.
+        Feature weights {f1..f9: float}. Defaults to PRIOR_WEIGHTS.
     bootstrap_n : int
-        Number of bootstrap iterations for CI estimation.
-        Default 1000; use 500 for faster runs during development.
+        Bootstrap iterations for CI. Default 1000.
     seed : int or None
-        Random seed for bootstrap reproducibility.
+        Random seed for reproducibility.
 
     Returns
     -------
     CPSResult
-        Complete scoring result with CPS, CI, classification, and contributions.
-
-    Notes
-    -----
-    Bootstrap CI estimation: Rather than resampling the training set (which
-    would require the training data to be passed), we approximate the CI by
-    adding noise to each feature value proportional to its expected uncertainty.
-    This is the empirical uncertainty approach from Pejaver et al. (2022).
-
-    For variants with ClinVar high-confidence classifications (P/LP or B/LB with
-    >=2 stars), the CPS is reported but marked with clinvar_override=True and the
-    classification defaults to the ClinVar verdict.
     """
     if weights is None:
         weights = dict(PRIOR_WEIGHTS)
 
     # Adjust weights for transmembrane domains
     if features.is_tm_domain:
-        for feature, adj in TM_WEIGHT_ADJUSTMENT.items():
-            if feature in weights:
-                weights[feature] = weights[feature] * adj
+        for feat, adj in TM_WEIGHT_ADJUSTMENT.items():
+            if feat in weights:
+                weights[feat] = weights[feat] * adj
 
-    # Check for high-confidence ClinVar override
+    # Check for ClinVar override
     clinvar_override = False
     if features.clinvar_sig in (
-        "Pathogenic", "Likely pathogenic", "Pathogenic/Likely pathogenic"
+        "Pathogenic", "Likely pathogenic", "Pathogenic/Likely pathogenic",
+        "Benign", "Likely benign", "Benign/Likely benign",
     ):
         clinvar_override = True
-    elif features.clinvar_sig in ("Benign", "Likely benign", "Benign/Likely benign"):
-        clinvar_override = True
 
-    # Compute point estimate CPS
-    fv = features.feature_vector  # [f1..f8], None -> 0.5
+    # Point estimate CPS
+    fv = features.feature_vector   # [f1..f9], None -> 0.5
     w_list = [weights[f] for f in FEATURE_NAMES]
-
     cps_point = _weighted_mean(fv, w_list)
 
-    # Feature contributions
+    # Per-feature contributions
     w_total = sum(w_list)
     contributions = {
         name: (w * f) / w_total
@@ -214,13 +188,15 @@ def compute_cps(
     if clinvar_override and features.clinvar_sig:
         classification = _classify_from_clinvar(features.clinvar_sig)
 
-    # Confidence flag
-    confidence_flag = None
+    # Confidence flags
+    flags = []
     if features.is_tm_domain and features.f2 is not None:
-        confidence_flag = "TM_DDG_UNRELIABLE"
+        flags.append("TM_DDG_UNRELIABLE")
     if features.data_completeness < 0.5:
-        flag_text = "LOW_COMPLETENESS"
-        confidence_flag = f"{confidence_flag},{flag_text}" if confidence_flag else flag_text
+        flags.append("LOW_COMPLETENESS")
+    if features.domain == "C_terminal" and features.data_completeness < 1.0:
+        flags.append("CTERMINAL_UNDERPOWERED")
+    confidence_flag = ",".join(flags) if flags else None
 
     return CPSResult(
         variant_id=features.variant_id,
@@ -240,45 +216,37 @@ def compute_cps(
     )
 
 
-def _weighted_mean(features: list[float], weights: list[float]) -> float:
-    """Compute weighted mean of features. All inputs must be same length."""
+def _weighted_mean(feat_vals: list, weights: list) -> float:
+    """Weighted mean of feature values. All lists must be same length."""
     total_w = sum(weights)
     if total_w == 0:
         return 0.5
-    return sum(f * w for f, w in zip(features, weights)) / total_w
+    return sum(f * w for f, w in zip(feat_vals, weights)) / total_w
 
 
 def _bootstrap_ci(
-    fv: list[float],
-    weights: list[float],
+    fv: list,
+    weights: list,
     features: VariantFeatures,
     n: int = 1000,
     seed: Optional[int] = 42,
     alpha: float = 0.05,
-) -> tuple[float, float]:
+):
     """
-    Approximate bootstrap CI by perturbing feature values.
+    Approximate bootstrap CI by perturbing feature values with Gaussian noise.
 
-    Each feature is perturbed by Gaussian noise with standard deviation
-    proportional to its expected measurement error:
-      - f1 (AF): +/-0.05 (sampling uncertainty in gnomAD)
-      - f2 (dDDG): +/-0.10 (FoldX reported RMSE ~1 kcal/mol -> +/-0.10 in sigmoid space)
-      - f3 (RMSD): +/-0.08
-      - f4 (conservation): +/-0.08 (rate4site estimation uncertainty)
-      - f5 (domain): +/-0.0 (deterministic)
-      - f6 (AlphaMissense): +/-0.05 (model uncertainty)
-      - f7 (CADD): +/-0.05
-      - f8 (Grantham): +/-0.0 (deterministic)
-
-    Missing features (imputed as 0.5) get larger noise (+/-0.15) to reflect
-    greater uncertainty from missingness.
+    Noise standard deviations reflect expected measurement uncertainty:
+      f1 (AF): 0.05     f2 (dDDG): 0.10    f3 (RMSD): 0.08
+      f4 (cons): 0.08   f5 (domain): 0.00  f6 (AM): 0.05
+      f7 (CADD): 0.05   f8 (Gran): 0.00    f9 (pore): 0.05
+    Missing features receive 0.15 (higher uncertainty from imputation).
     """
-    NOISE_SD = [0.05, 0.10, 0.08, 0.08, 0.00, 0.05, 0.05, 0.00]
+    NOISE_SD = [0.05, 0.10, 0.08, 0.08, 0.00, 0.05, 0.05, 0.00, 0.05]
     MISSING_SD = 0.15
 
     raw_features = [
         features.f1, features.f2, features.f3, features.f4,
-        features.f5, features.f6, features.f7, features.f8
+        features.f5, features.f6, features.f7, features.f8, features.f9
     ]
 
     rng = random.Random(seed)
@@ -286,14 +254,9 @@ def _bootstrap_ci(
 
     for _ in range(n):
         perturbed = []
-        for i, (f_raw, f_val, sd) in enumerate(zip(raw_features, fv, NOISE_SD)):
-            if f_raw is None:
-                # Missing feature: wider noise
-                noise = rng.gauss(0, MISSING_SD)
-            else:
-                noise = rng.gauss(0, sd) if sd > 0 else 0
+        for f_raw, f_val, sd in zip(raw_features, fv, NOISE_SD):
+            noise = rng.gauss(0, MISSING_SD if f_raw is None else (sd if sd > 0 else 0))
             perturbed.append(max(0.0, min(1.0, f_val + noise)))
-
         samples.append(_weighted_mean(perturbed, weights))
 
     samples.sort()
@@ -303,7 +266,7 @@ def _bootstrap_ci(
 
 
 def _classify(cps: float) -> str:
-    """Map CPS to classification string."""
+    """Map CPS value to classification string."""
     if cps >= CPS_THRESHOLDS["likely_pathogenic"]:
         return "Likely Pathogenic"
     elif cps >= CPS_THRESHOLDS["possibly_pathogenic"]:
@@ -312,8 +275,7 @@ def _classify(cps: float) -> str:
         return "Uncertain Significance"
     elif cps >= CPS_THRESHOLDS["possibly_benign"]:
         return "Possibly Benign"
-    else:
-        return "Likely Benign"
+    return "Likely Benign"
 
 
 def _classify_from_clinvar(clinvar_sig: str) -> str:
@@ -326,37 +288,26 @@ def _classify_from_clinvar(clinvar_sig: str) -> str:
 
 
 def train_logistic_weights(
-    features_list: list[VariantFeatures],
-    labels: list[int],
+    features_list: list,
+    labels: list,
     cv_folds: int = 5,
     seed: int = 42,
-) -> tuple[dict, float]:
+):
     """
     Learn feature weights from ClinVar training data via logistic regression.
 
     Parameters
     ----------
     features_list : list of VariantFeatures
-        Feature vectors for training variants.
     labels : list of int
-        Binary labels: 1 for Pathogenic/LP, 0 for Benign/LB.
+        1 = P/LP, 0 = B/LB.
     cv_folds : int
-        Number of cross-validation folds for AUROC estimation.
     seed : int
-        Random seed.
 
     Returns
     -------
     weights : dict
-        Learned weights {f1..f8: float} (from logistic regression coefficients).
     cv_auroc : float
-        Mean AUROC across CV folds.
-
-    Notes
-    -----
-    Requires scikit-learn. Install with: pip install scikit-learn
-    When training set has fewer than 50 P/LP variants, logistic regression
-    is likely to overfit. In that case, fall back to prior weights.
     """
     try:
         from sklearn.linear_model import LogisticRegression
@@ -364,12 +315,11 @@ def train_logistic_weights(
         from sklearn.preprocessing import StandardScaler
         import numpy as np
     except ImportError:
-        raise ImportError("scikit-learn required for weight training: pip install scikit-learn")
+        raise ImportError("pip install scikit-learn")
 
     if len(features_list) < 30:
         logger.warning(
-            "Training set too small (%d variants) for logistic regression. "
-            "Using expert-set prior weights.",
+            "Training set too small (%d variants). Using prior weights.",
             len(features_list),
         )
         return dict(PRIOR_WEIGHTS), float("nan")
@@ -390,29 +340,23 @@ def train_logistic_weights(
         cv_auroc, auroc_scores.std(), cv_folds,
     )
 
-    # Fit on full training set
     clf.fit(X_scaled, y)
     coef = clf.coef_[0]
 
-    # Map coefficients to positive weights (logistic regression coefficients can be negative
-    # if a feature is inversely related to pathogenicity; but our features are already
-    # oriented so that higher = more pathogenic, so negative coefficients indicate
-    # the feature was not learned as expected -- flag and fall back to prior for those)
     weights = {}
     for i, name in enumerate(FEATURE_NAMES):
         learned = float(coef[i])
         prior = PRIOR_WEIGHTS[name]
         if learned < 0:
             logger.warning(
-                "Feature %s has negative learned weight (%.3f). "
-                "Feature orientation may be wrong; using prior weight %.1f.",
+                "Feature %s has negative learned weight (%.3f). Using prior %.1f.",
                 name, learned, prior,
             )
             weights[name] = prior
         else:
             weights[name] = learned
 
-    # Normalize weights to same total as prior weights for comparability
+    # Normalize to same total as prior weights
     prior_total = sum(PRIOR_WEIGHTS.values())
     learned_total = sum(weights.values())
     if learned_total > 0:
@@ -423,33 +367,24 @@ def train_logistic_weights(
 
 
 def batch_score(
-    features_list: list[VariantFeatures],
+    features_list: list,
     weights: Optional[dict] = None,
     bootstrap_n: int = 200,
-) -> list[CPSResult]:
+) -> list:
     """
-    Score a list of variants. Uses reduced bootstrap (200) by default for batch efficiency.
+    Score a list of VariantFeatures. Uses reduced bootstrap (200) for speed.
 
-    Parameters
-    ----------
-    features_list : list of VariantFeatures
-    weights : dict or None
-    bootstrap_n : int
-
-    Returns
-    -------
-    list of CPSResult
+    Returns list of CPSResult.
     """
     results = []
     for fv in features_list:
-        result = compute_cps(fv, weights=weights, bootstrap_n=bootstrap_n)
-        results.append(result)
-    logger.info("Scored %d variants", len(results))
+        results.append(compute_cps(fv, weights=weights, bootstrap_n=bootstrap_n))
+    logger.info("Scored %d variants.", len(results))
     return results
 
 
-def summarize_scores(results: list[CPSResult]) -> dict:
-    """Generate summary statistics for a list of CPS results."""
+def summarize_scores(results: list) -> dict:
+    """Generate summary statistics for a list of CPSResult."""
     from collections import Counter
     classifications = Counter(r.classification for r in results)
     scores = [r.cps for r in results]
@@ -458,7 +393,11 @@ def summarize_scores(results: list[CPSResult]) -> dict:
         "classifications": dict(classifications),
         "mean_cps": sum(scores) / len(scores) if scores else float("nan"),
         "median_cps": sorted(scores)[len(scores) // 2] if scores else float("nan"),
-        "n_high_confidence": sum(1 for r in results if r.ci_upper - r.ci_lower < 0.2),
-        "n_tm_flagged": sum(1 for r in results if r.is_tm_domain and r.confidence_flag),
+        "n_high_confidence": sum(
+            1 for r in results if r.ci_upper - r.ci_lower < 0.2
+        ),
+        "n_tm_flagged": sum(
+            1 for r in results if r.is_tm_domain and r.confidence_flag
+        ),
         "n_clinvar_override": sum(1 for r in results if r.clinvar_override),
     }

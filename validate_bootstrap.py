@@ -134,4 +134,3 @@ elif np.mean(boot_deltas <= 0) < 0.10:
     print("RESULT: FoldX improvement is a non-significant trend (p < 0.10, CI includes 0)")
 else:
     print("RESULT: FoldX improvement is not statistically significant")
-PYEOF
