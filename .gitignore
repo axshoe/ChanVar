@@ -62,3 +62,5 @@ objects.txt
 
 # pytest cache
 .pytest_cache/
+
+**/SETUP.md
